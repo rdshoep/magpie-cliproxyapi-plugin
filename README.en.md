@@ -28,9 +28,13 @@ After signing in while Magpie is running, run `magpie plugin on <installed packa
 | CPA Base URL | Required, e.g. `https://cpa.example.invalid`. A trailing `/v1` is removed. URL userinfo, query strings and fragments are rejected. |
 | Business API key | Required password input for the CPA business key, used for model discovery and inference. The plugin trims surrounding whitespace and returns it to Magpie. |
 | Management key | Optional password input for quota and Claude / Codex reasoning levels. Inference works without it; the plugin makes no management requests and shows no reasoning levels. |
-| Management URL | Optional **complete management endpoint**, e.g. `http://127.0.0.1:8317/v8/management`. Defaults to `<CPA Base URL>/v8/management`. |
+| Management URL | Optional **complete management endpoint**, e.g. `http://127.0.0.1:8317/v8/management`. Defaults to `<CPA Base URL>/v8/management`. Use `https://` or a tunnel for non-loopback hosts. |
 | CPA credential | Optional exact CPA credential `name` or `auth_index`. |
 | Model quota routing | Disabled by default. Enable only after confirming that no config API keys, openai-compatibility sources or plugins serve the same model IDs. |
+| Model filter | Optional comma-separated wildcards (supports `!` exclusions), e.g. `claude-*,gpt-*,!*-legacy`. Always excludes `claude-fable-5-dd-`. |
+| Display group prefix | Disabled by default. Prepends `[Claude]` / `[OpenAI]` / `[Gemini]` etc. to display names without altering model IDs. |
+| Quota query mode | Default `auto` (passive CPA signals first, active fallback); optional `passive-only` (read CPA signals only, never call upstream endpoints). |
+| Verify connection | Default `skip` (offline save); optional `check` (single read-only probe during sign-in; management failures never block business login). |
 
 The plugin's sign-in prompts collect the business key. Newer Magpie (source checked at v0.1.4139) does not ask for a separate key. Older versions (source checked at v0.1.2738 and v0.1.3431) may ask again; the key collected by the plugin takes precedence.
 
@@ -109,7 +113,7 @@ Anthropic rate-limits `oauth/usage` hard. The plugin keeps requests down as foll
 
 CPA bans a source IP for 30 minutes after five management authentication failures, including loopback. After management HTTP 401/403 (including the reasoning-level read during model discovery), the plugin stops automatic requests for that endpoint and key. Changing only the credential selection does not unblock it. Quota errors do not invalidate business inference or the account's sign-in state.
 
-Fix the management key and remote access settings first. Then sign in with a different management key or endpoint, or restart the Magpie plugin host after fixing the configuration. **Fixing CPA settings and signing in again with the same key and endpoint does not clear the running process's blocked state.** The state lives only in the plugin process; a new CLI process or restart can try again, so avoid repeatedly starting queries with a bad key.
+Fix the management key and remote access settings first, then re-run `magpie plugin login cpa` to **immediately reset the running plugin process's 401/403 blocked state and quota/list caches** (even when signing in again with the same key and endpoint), without restarting the Magpie host. Avoid repeatedly starting queries with an invalid key.
 
 Temporary management failures back off for 300 seconds; upstream backoff is described above. Successful readings are cached for 300 seconds and concurrent calls share one read. The plugin reuses readings for at most 900 seconds and never substitutes zero for missing or erroneous quota. The complete management read has a 15-second deadline.
 
@@ -158,11 +162,15 @@ To add a quota adapter for another provider:
 
 An unspecified selection reads all enabled supported credentials. A new adapter adds windows to mixed pools. With model quota routing disabled, only a sole enabled credential participates in routing; see above for the enabled behavior.
 
-## Development and acknowledgment
+## Security & Development
 
 ```sh
-npm test
+bun test
+bun run typecheck
+bun run doctor -- --base-url https://cpa.example.invalid --api-key <BIZ_KEY>
 ```
+
+The plugin has zero external runtime dependencies, locks `loader.fetch` targets to the configured `baseURL` origin/prefix with `redirect: "error"`, enforces headers-only inference timeouts so long SSE streams are not aborted, and redacts secrets in all errors and diagnostics.
 
 Tests use fictional keys and local mocks; no real account is required. Isolated official-host integration is separate evidence and does not replace real CPA acceptance.
 

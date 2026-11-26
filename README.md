@@ -30,9 +30,13 @@ Magpie 服务运行中执行登录后，请运行 `magpie plugin on <安装时�
 | CPA Base URL | 必填，例如 `https://cpa.example.invalid`。允许尾部 `/v1`，会自动去掉；不允许 URL 用户信息、query 或 fragment。 |
 | Business API key | 必填，密码输入；CPA 业务 key，用于模型发现与推理。插件去掉首尾空白后返回给 Magpie。 |
 | Management key | 可选，密码输入；用于额度及 Claude / Codex 思考等级。不填仍可推理，但不查询管理接口，也不显示思考等级。 |
-| Management URL | 可选，**完整管理入口**，例如 `http://127.0.0.1:8317/v8/management`；默认 `<CPA Base URL>/v8/management`。 |
+| Management URL | 可选，**完整管理入口**，例如 `http://127.0.0.1:8317/v8/management`；默认 `<CPA Base URL>/v8/management`。非本机回环地址建议使用 `https://` 或隧道。 |
 | CPA credential | 可选，按 CPA 凭据的 `name` 或 `auth_index` 精确选择。 |
 | Model quota routing | 默认关闭。仅在确认 CPA 没有配置文件 API key、openai-compatibility 或插件提供同名模型时开启。 |
+| Model filter | 可选，逗号分隔通配符（支持 `!` 排除），例如 `claude-*,gpt-*,!*-legacy`，默认全保留（始终排除 `claude-fable-5-dd-`）。 |
+| Display group prefix | 默认关闭。开启后在显示名称前附加 `[Claude]` / `[OpenAI]` / `[Gemini]` 等分组标签，不修改真实模型 ID。 |
+| Quota query mode | 默认 `auto`（优先使用 CPA 被动信号，缺失时主动查上游）；可选 `passive-only`（仅读取 CPA `/credentials` 中的被动信号，不发上游请求）。 |
+| Verify connection | 默认 `skip`（离线保存）；可选 `check`（登录时单次只读探测业务连通性，管理口探测失败仅降级而不阻断登录）。 |
 
 业务 key 由插件的登录字段收集。新版 Magpie（已核对 v0.1.4139）不再单独询问 key；旧版（已核对 v0.1.2738、v0.1.3431）可能会再问一次，以插件收集的业务 key 为准。
 
@@ -111,7 +115,7 @@ Anthropic 对 `oauth/usage` 限流很严。插件按以下方式减少请求：
 
 CPA 对同一来源 IP 的管理鉴权失败累计 5 次会封禁 30 分钟，包括回环地址。插件遇到管理端 401/403 后（包括模型发现时读取思考等级），会停止对该管理入口和 key 的自动请求；改凭据选择不会解除停试。业务推理和业务账号状态不因额度错误而失效。
 
-先修正管理 key 和远程访问设置，再恢复查询：更换管理 key 或管理入口并重新登录，或在配置修好后重启运行插件的 Magpie 宿主进程。**仅修复 CPA 侧设置，然后以相同 key/入口重新登录，不会清除原进程的停试状态。** 停试状态仅在当前插件进程内维护；新 CLI 进程或重启可能重新尝试，因此不要用错误 key 反复启动查询。
+先修正管理 key 和远程访问设置，再恢复查询：重新运行 `magpie plugin login cpa` 即可**立即重置当前插件进程内的 401/403 停试状态与额度/列表缓存**（即使用相同 key/入口重新登录也会清除原进程熔断），无需重启 Magpie 宿主。新 CLI 进程也会从干净状态开始，因此请先修正配置再重新查询，避免反复用错误密钥触发 CPA 封禁。
 
 管理端临时错误退避 300 秒，上游错误的退避见上文；成功读数缓存 300 秒，并发调用合并为一次读取。插件最多沿用 900 秒内的旧读数，缺失或错误额度不会填成 0%。整次管理读取最多 15 秒。
 
@@ -161,11 +165,36 @@ PR 请遵守以下约定：
 
 注意：未指定凭据时会读取全部启用且受支持的凭据。新增适配器会增加混合池展示的窗口。按模型路由关闭时，只有唯一启用凭据的窗口参与路由；开启后的规则见上文。
 
-## 开发与致谢
+## 安全架构与能力边界
+
+- **零外部运行时依赖**：仅使用 Bun/Node 内置 `node:crypto` 与标准 Web API，无任何第三方包与安装生命周期脚本。
+- **最小网络权限与目标锁定**：`loader.fetch` 强制校验请求 URL 属于用户配置的 `baseURL` 源与路径前缀，并强制 `redirect: "error"` 防止重定向泄露密钥；所有 `fetch` 均有显式超时控制（推理链路仅对响应头做 120s 超时，拿到响应头即释放计时器，不中断长 SSE 流）。
+- **凭证脱敏与零本机探测**：不读取 `~/.claude`、`~/.codex`、`~/.ssh` 等敏感目录或环境变量，无 `console.*` 日志输出；错误信息与诊断输出统一经过前 4 后 4 掩码脱敏。
+- **能力边界**：Magpie 插件仅提供只读配额与模型推理接入；**消耗重置卡、凭据冷却重置、启停凭据及 OAuth 刷新**仍须在 CPA 管理面板操作。
+
+## 开发、诊断与本地热重载
 
 ```sh
-npm test
+bun test
+bun run typecheck
 ```
+
+只读连通性自检（手动传入参数，不读取本机文件，输出自动脱敏）：
+
+```sh
+bun run doctor -- --base-url https://cpa.example.invalid --api-key <BIZ_KEY> [--management-url <MGMT_URL> --management-key <MGMT_KEY>]
+```
+
+本地目录加载与热重载验证：
+
+```sh
+magpie plugin add /absolute/path/to/magpie-cliproxyapi-plugin
+magpie plugin login cpa
+magpie plugin on /absolute/path/to/magpie-cliproxyapi-plugin
+magpie providers && magpie models && magpie quota --json
+```
+
+修改本地源码后，再次执行 `magpie plugin on /absolute/path/to/magpie-cliproxyapi-plugin` 即可完成热重载验证。
 
 测试使用虚构 key 和本机 mock，不需要真实账号。官方宿主联调另有隔离证据，不能代替真实 CPA 验收。
 

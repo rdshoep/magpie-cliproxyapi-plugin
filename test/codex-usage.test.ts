@@ -1,0 +1,441 @@
+import { expect, test } from "bun:test";
+import { _internal } from "../index.ts";
+import type { CPACredential, FetchLike } from "../src/types.ts";
+
+const now = Date.parse("2026-11-14T08:00:00Z");
+const codex: CPACredential = {
+  provider: "codex",
+  disabled: false,
+  auth_index: "0123456789abcdef",
+  name: "private@example.invalid.json",
+  id_token: { chatgpt_account_id: "fictional-workspace" },
+};
+const claude: CPACredential = {
+  provider: "claude",
+  disabled: false,
+  auth_index: "fedcba9876543210",
+  label: "Alpha",
+};
+const windowRow = (used_percent = 25, limit_window_seconds = 18000) => ({
+  used_percent,
+  limit_window_seconds,
+  reset_at: now / 1000 + 3600,
+});
+const data = () => ({
+  plan_type: "plus",
+  rate_limit: { primary_window: windowRow(), secondary_window: windowRow(50, 604800) },
+});
+const claudeData = () => ({
+  five_hour: { utilization: 25, resets_at: new Date(now + 3600000).toISOString() },
+  seven_day: { utilization: 50, resets_at: new Date(now + 604800000).toISOString() },
+  cedar_ember: { eligible: true, grants: [{ id: "fictional", type: "session", resets_left: 1 }] },
+});
+const response = (body: unknown, status_code = 200) =>
+  Response.json({ status_code, body: JSON.stringify(body) });
+
+function harness(
+  files: CPACredential[] = [codex],
+  payload: unknown = data(),
+  request?: (body: { auth_index: string; url: string }, init?: RequestInit) => Response | Promise<Response>,
+  timeout?: (ms: number) => AbortSignal,
+) {
+  let clock = now;
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const fetchFn: FetchLike = async (input, init) => {
+    const url = String(input);
+    calls.push({ url, init });
+    if (url.endsWith("/credentials")) return Response.json({ files });
+    const body = JSON.parse(String(init?.body)) as { auth_index: string; url: string };
+    if (request) return request(body, init);
+    return response(body.url.includes("anthropic.com") ? claudeData() : payload);
+  };
+  const read = _internal.createUsage({
+    now: () => clock,
+    ...(timeout ? { timeout } : {}),
+    request: fetchFn,
+  });
+  return {
+    calls,
+    advance: (ms: number) => {
+      clock += ms;
+    },
+    get: (credential?: string) =>
+      read(() => ({
+        type: "api",
+        key: "fictional-business",
+        metadata: {
+          baseURL: "https://cpa.example.invalid",
+          managementKey: "fictional-management",
+          ...(credential ? { credential } : {}),
+        },
+      })),
+  };
+}
+
+function signals(overrides: Record<string, unknown> = {}) {
+  return {
+    observed_at: new Date(now).toISOString(),
+    signals: {
+      "X-Codex-Primary-Used-Percent": "12.5",
+      "X-Codex-Primary-Window-Minutes": "300",
+      "X-Codex-Primary-Reset-At": String(now / 1000 + 3600),
+      "X-Codex-Secondary-Used-Percent": "65",
+      "X-Codex-Secondary-Window-Minutes": "10080",
+      "X-Codex-Secondary-Reset-After-Seconds": "7200",
+      "X-Codex-Plan-Type": "plus",
+      ...overrides,
+    },
+  };
+}
+
+test("Codex uses wham via shared api-call, the management-center UA and optional workspace header", async () => {
+  for (const id_token of [
+    codex.id_token,
+    undefined,
+    {},
+    { chatgpt_account_id: "" },
+    { chatgpt_account_id: "bad\r\nheader" },
+  ]) {
+    const h = harness([{ ...codex, id_token }]);
+    const result = await h.get();
+    expect(result).toEqual({
+      windows: [
+        { name: "5 hours", used: 25, span: 18000, resetsAt: new Date(now + 3600000).toISOString() },
+        { name: "7 days", used: 50, span: 604800, resetsAt: new Date(now + 3600000).toISOString() },
+      ],
+      plan: "plus",
+      signIn: "kept",
+    });
+    const body = JSON.parse(String(h.calls[1].init?.body));
+    expect(body).toEqual({
+      auth_index: codex.auth_index,
+      method: "GET",
+      url: "https://chatgpt.com/backend-api/wham/usage",
+      header: {
+        Authorization: "Bearer $TOKEN$",
+        "Content-Type": "application/json",
+        "User-Agent": "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)",
+        ...(id_token === codex.id_token ? { "Chatgpt-Account-Id": "fictional-workspace" } : {}),
+      },
+    });
+    expect(h.calls[0].init?.signal).toBe(h.calls[1].init?.signal);
+    expect(h.calls[1].init?.redirect).toBe("error");
+    expect(JSON.stringify(result).includes("fictional-workspace")).toBe(false);
+    expect((await h.get(codex.auth_index)).plan).toBe("plus");
+    expect(h.calls).toHaveLength(3);
+  }
+});
+
+test("Codex duration names cover monthly, non-hour and singular windows; only known plans survive", async () => {
+  for (const [span, name] of [
+    [2592000, "30 days"],
+    [5400, "90 minutes"],
+    [3600, "1 hour"],
+    [61, "61 seconds"],
+  ] as const) {
+    const result = await harness([codex], {
+      plan_type: "free",
+      rate_limit: { primary_window: windowRow(0, span) },
+    }).get();
+    expect(result.windows?.[0].name).toBe(name);
+    expect(result.plan).toBe("free");
+  }
+  for (const plan_type of ["unknown", "private@example.invalid", {}, "PLUS", "plus\n"]) {
+    expect((await harness([codex], { ...data(), plan_type }).get()).plan).toBeUndefined();
+  }
+});
+
+test("Codex skips malformed windows and errors when none is valid", async () => {
+  const malformed = [
+    null,
+    {},
+    { ...windowRow(), used_percent: "1" },
+    { ...windowRow(), used_percent: -1 },
+    { ...windowRow(), used_percent: 101 },
+    { ...windowRow(), used_percent: Infinity },
+    { ...windowRow(), limit_window_seconds: 0 },
+    { ...windowRow(), limit_window_seconds: 1.5 },
+    { ...windowRow(), limit_window_seconds: "18000" },
+    { ...windowRow(), reset_at: "1794646800" },
+    { ...windowRow(), reset_at: -1 },
+    { ...windowRow(), reset_at: 8.64e12 + 1 },
+  ];
+  for (const row of malformed) {
+    const result = await harness([codex], {
+      rate_limit: { primary_window: row, secondary_window: windowRow(50) },
+    }).get();
+    expect(result.windows).toHaveLength(1);
+    expect(result.windows?.[0].used).toBe(50);
+    const failed = await harness([codex], { rate_limit: { primary_window: row } }).get();
+    expect(failed.error).toMatch(/未返回有效的 Codex 配额窗口/);
+    expect(failed.windows).toBeUndefined();
+    expect(failed.signIn).toBe("kept");
+  }
+  expect((await harness([codex], { additional_rate_limits: [{ rate_limit: data().rate_limit }] }).get()).error).toBeDefined();
+});
+
+test("fresh complete Codex signals avoid usage reads, preserve plan and anchor relative resets to observation time", async () => {
+  const h = harness([{ ...codex, quota: signals() }]);
+  const result = await h.get();
+  expect(h.calls).toHaveLength(2);
+  expect(result.windows?.map(w => [w.name, w.used, w.span])).toEqual([
+    ["5 hours", 12.5, 18000],
+    ["7 days", 65, 604800],
+  ]);
+  expect(result.plan).toBe("plus");
+  h.advance(300000);
+  const later = await h.get();
+  expect(later.windows?.[1].resetsAt).toBe(new Date(now + 7200000).toISOString());
+  expect(h.calls).toHaveLength(3);
+});
+
+test("old, future, partial, expired and malformed Codex signals fall back to wham", async () => {
+  const bad = [
+    undefined,
+    { ...signals(), observed_at: "bad" },
+    { ...signals(), observed_at: new Date(now - 300001).toISOString() },
+    { ...signals(), observed_at: new Date(now + 60001).toISOString() },
+    signals({ "X-Codex-Secondary-Used-Percent": undefined }),
+    signals({ "X-Codex-Primary-Used-Percent": "101" }),
+    signals({ "X-Codex-Primary-Window-Minutes": "0" }),
+    signals({ "X-Codex-Primary-Reset-At": String(now / 1000) }),
+    signals({ "X-Codex-Primary-Used-Percent": "1e2" }),
+    signals({ "X-Codex-Primary-Reset-At": "9999999999999" }),
+  ];
+  for (const quota of bad) {
+    const h = harness([{ ...codex, quota }]);
+    const result = await h.get();
+    expect(result.windows?.[0].used).toBe(25);
+    expect(h.calls).toHaveLength(3);
+  }
+});
+
+test("pure Claude, pure Codex and mixed pools display all supported credentials in stable order", async () => {
+  const otherCodex = { ...codex, auth_index: "1123456789abcdef", label: "Zulu" };
+  const otherClaude = { ...claude, auth_index: "eedcba9876543210", label: "Beta" };
+  for (const files of [
+    [otherClaude, claude],
+    [otherCodex, codex],
+    [otherCodex, claude, codex, otherClaude],
+  ]) {
+    const first = await harness(files).get();
+    const reordered = await harness([...files].reverse()).get();
+    expect(first).toEqual(reordered);
+    expect(first.windows).toHaveLength(files.length * 2);
+    expect(first.windows?.every(w => w.aside === true)).toBe(true);
+    expect(first.plan).toBeUndefined();
+    expect(first.resets).toBeUndefined();
+    expect(JSON.stringify(first).includes("@")).toBe(false);
+    expect(first.windows?.[0].name.startsWith("5 hours (")).toBe(true);
+  }
+  const mixed = await harness([codex, claude]).get();
+  expect(mixed.windows?.map(w => w.name)).toEqual([
+    "5 hours (Claude Alpha)",
+    "7 days (Claude Alpha)",
+    "5 hours (Codex 01234567)",
+    "7 days (Codex 01234567)",
+  ]);
+  const selected = await harness([codex, claude]).get(claude.auth_index);
+  expect(selected.windows).toHaveLength(2);
+  expect(selected.windows?.every(w => w.aside)).toBe(true);
+  expect(selected.resets?.count).toBe(1);
+  expect((await harness([claude]).get()).resets?.count).toBe(1);
+});
+
+test("names and email-like labels are never displayed; fallback labels remain stable under reorder", async () => {
+  const h = harness([
+    { ...codex, label: "private@example.invalid" },
+    { ...claude, label: "\nunsafe" },
+  ]);
+  const result = await h.get();
+  expect(JSON.stringify(result).includes("@")).toBe(false);
+  expect(result.windows?.some(w => w.name.endsWith("(Codex 01234567)"))).toBe(true);
+  const selected = await h.get(codex.name);
+  expect(selected.windows?.every(w => w.name.endsWith("(Codex 01234567)"))).toBe(true);
+});
+
+test("a failed credential is a text aside row; all failed credentials return an error", async () => {
+  const h = harness([codex, claude], data(), body =>
+    body.auth_index === codex.auth_index ? response({}, 401) : response(claudeData()),
+  );
+  const result = await h.get();
+  expect(result.error).toBeUndefined();
+  expect(result.windows).toHaveLength(3);
+  expect(result.windows?.[2]).toEqual({
+    name: "Codex 01234567",
+    display: "额度暂不可用，请在 CPA 管理面板检查该凭据",
+    aside: true,
+  });
+  expect(result.windows?.every(w => w.aside)).toBe(true);
+  const all = await harness([codex, claude], data(), () => response({}, 500)).get();
+  expect(all.error).toBeDefined();
+  expect(all.windows).toBeUndefined();
+});
+
+test("credential reads use the scope limit of two and share the 15-second signal", async () => {
+  let running = 0;
+  let peak = 0;
+  const pending: Array<() => void> = [];
+  const files = Array.from({ length: 5 }, (_, i) => ({ ...codex, auth_index: String(i).padStart(16, "0") }));
+  const h = harness(
+    files,
+    data(),
+    () =>
+      new Promise(resolve => {
+        running++;
+        peak = Math.max(peak, running);
+        pending.push(() => {
+          running--;
+          resolve(response(data()));
+        });
+      }),
+  );
+  const reading = h.get();
+  const turn = () => new Promise<void>(resolve => setImmediate(resolve));
+  await turn();
+  expect(pending).toHaveLength(2);
+  while (pending.length) {
+    pending.shift()!();
+    await turn();
+  }
+  expect((await reading).windows).toHaveLength(10);
+  expect(peak).toBe(2);
+  expect(h.calls).toHaveLength(11);
+  expect(h.calls.every(call => call.init?.signal instanceof AbortSignal)).toBe(true);
+  expect(
+    h.calls
+      .filter(call => !call.init?.body || (JSON.parse(String(call.init.body)) as { url: string }).url.endsWith("/wham/usage"))
+      .every(call => call.init?.signal === h.calls[0].init?.signal),
+  ).toBe(true);
+});
+
+test("multi-credential management 401/403 stop queued reads and later selections", async () => {
+  for (const status of [401, 403]) {
+    let calls = 0;
+    const files = Array.from({ length: 5 }, (_, i) => ({ ...codex, auth_index: String(i).padStart(16, "0") }));
+    const h = harness(files, data(), () => {
+      calls++;
+      return new Response("private", { status });
+    });
+    const result = await h.get();
+    expect(result.error).toMatch(/管理接口拒绝访问|管理密钥无效/);
+    expect(result.windows).toBeUndefined();
+    expect(calls).toBeLessThanOrEqual(2);
+    h.advance(3600000);
+    await h.get(files[4].auth_index);
+    expect(calls).toBeLessThanOrEqual(2);
+  }
+});
+
+test("all credential reads stop at the common budget even if a transport ignores abort", async () => {
+  const controller = new AbortController();
+  const files = Array.from({ length: 5 }, (_, i) => ({ ...codex, auth_index: String(i).padStart(16, "0") }));
+  let budget: number | undefined;
+  const h = harness(
+    files,
+    data(),
+    () => new Promise(() => {}),
+    ms => {
+      budget = ms;
+      return controller.signal;
+    },
+  );
+  const pending = h.get();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  controller.abort(new Error("budget expired"));
+  const result = await pending;
+  expect(result.error).toBeDefined();
+  expect(result.windows).toBeUndefined();
+  expect(budget).toBe(15000);
+  expect(h.calls).toHaveLength(3);
+});
+
+test("the two-read limit also covers different selections refreshed together", async () => {
+  let running = 0;
+  let peak = 0;
+  const pending: Array<() => void> = [];
+  const files = Array.from({ length: 4 }, (_, i) => ({ ...codex, auth_index: String(i).padStart(16, "0") }));
+  const h = harness(
+    files,
+    data(),
+    () =>
+      new Promise(resolve => {
+        running++;
+        peak = Math.max(peak, running);
+        pending.push(() => {
+          running--;
+          resolve(response(data()));
+        });
+      }),
+  );
+  const results = Promise.all(files.map(file => h.get(file.auth_index)));
+  const turn = () => new Promise<void>(resolve => setImmediate(resolve));
+  await turn();
+  expect(pending).toHaveLength(2);
+  while (pending.length) {
+    pending.shift()!();
+    await turn();
+  }
+  expect((await results).every(result => result.windows?.length === 2)).toBe(true);
+  expect(peak).toBe(2);
+  expect(h.calls).toHaveLength(9);
+});
+
+test("management rejection cannot fall back to Claude passive windows or return a partial pool", async () => {
+  const quota = {
+    observed_at: new Date(now).toISOString(),
+    signals: {
+      "anthropic-ratelimit-unified-5h-utilization": "0.25",
+      "anthropic-ratelimit-unified-5h-reset": String(now / 1000 + 3600),
+      "anthropic-ratelimit-unified-7d-utilization": "0.5",
+      "anthropic-ratelimit-unified-7d-reset": String(now / 1000 + 604800),
+    },
+  };
+  const h = harness([{ ...claude, quota }, codex], data(), () => new Response("private", { status: 403 }));
+  const result = await h.get();
+  expect(result.error).toMatch(/管理接口拒绝访问|管理密钥无效/);
+  expect(result.windows).toBeUndefined();
+});
+
+test("an explicit Claude selection in a multi-credential CPA keeps resets while its windows stay aside", async () => {
+  for (const files of [
+    [claude, codex],
+    [claude, { ...claude, auth_index: "1123456789abcdef" }],
+  ]) {
+    const result = await harness(files).get(claude.auth_index);
+    expect(result.resets).toEqual({ count: 1, each: [{ window: "fiveHour" }] });
+    expect(result.windows?.every(window => window.aside === true)).toBe(true);
+    expect((await harness(files).get()).resets).toBeUndefined();
+  }
+  for (const quota of [undefined, signals()]) {
+    const h = harness([claude, { ...codex, quota }]);
+    const result = await h.get(codex.auth_index);
+    expect(result.plan).toBe("plus");
+    expect(result.windows?.every(window => window.aside === true)).toBe(true);
+    expect((await h.get()).plan).toBeUndefined();
+  }
+});
+
+test("active Codex windows use relative reset seconds or omit unknown resets without dropping quota", async () => {
+  const base = { used_percent: 25, limit_window_seconds: 18000 };
+  for (const [resetFields, expected] of [
+    [{ reset_after_seconds: 3600 }, new Date(now + 3600000).toISOString()],
+    [{ reset_at: null, reset_after_seconds: 0 }, new Date(now).toISOString()],
+    [{}, undefined],
+    [{ reset_at: null, reset_after_seconds: null }, undefined],
+    [{ reset_at: now / 1000 + 7200, reset_after_seconds: 3600 }, new Date(now + 7200000).toISOString()],
+  ] as const) {
+    const result = await harness([codex], { rate_limit: { primary_window: { ...base, ...resetFields } } }).get();
+    expect(result.windows).toHaveLength(1);
+    expect(result.windows?.[0].used).toBe(25);
+    expect(result.windows?.[0].span).toBe(18000);
+    expect(result.windows?.[0].resetsAt).toBe(expected);
+    expect(Object.hasOwn(result.windows![0], "resetsAt")).toBe(expected !== undefined);
+  }
+  for (const reset_after_seconds of [-1, "3600", 8.64e12]) {
+    const result = await harness([codex], {
+      rate_limit: { primary_window: { ...base, reset_after_seconds } },
+    }).get();
+    expect(result.error).toBeDefined();
+  }
+});
