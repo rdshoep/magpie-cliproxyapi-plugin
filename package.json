@@ -3,16 +3,19 @@
   "version": "0.0.5",
   "description": "Magpie provider for Claude via CLIProxyAPI, with optional quota, reset-card and reasoning-level readings",
   "type": "module",
-  "main": "./index.mjs",
-  "exports": "./index.mjs",
+  "main": "./index.ts",
+  "exports": "./index.ts",
   "files": [
-    "index.mjs",
+    "index.ts",
+    "src",
     "README.md",
     "README.en.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "doctor": "bun run scripts/doctor.ts"
   },
   "keywords": [
     "magpie-plugin",
@@ -21,7 +24,7 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "bun": ">=1.1.0"
   },
   "private": true,
   "repository": {
